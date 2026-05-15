@@ -42,10 +42,3 @@ xy/xz/yz planes: (1, 32, 64, 64) each
 tokens:  (1, 192, 256)
 samples: (1, 1024, 96)
 ```
-
-## Next Development Steps
-
-- Replace `ImageEncoder` with a pretrained image encoder.
-- Add a radiance or occupancy MLP on top of `sample_triplanes`.
-- Train with reconstruction losses from rendered views.
-- Feed the tokens into a language or multimodal transformer.
