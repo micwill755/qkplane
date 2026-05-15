@@ -1,0 +1,254 @@
+#!/usr/bin/env python3
+"""
+Minimal triplane tokenization prototype.
+
+The pipeline mirrors the diagram:
+  image -> image encoder -> learned triplanes (XY, XZ, YZ) -> patchify + MLP -> tokens
+
+This is intentionally compact, but the module boundaries are the ones you would
+grow for training: swap the image encoder, add volumetric rendering losses, or
+feed the emitted tokens into a transformer.
+"""
+
+from __future__ import annotations
+
+import argparse
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, Optional, Tuple
+
+import torch
+from torch import Tensor, nn
+import torch.nn.functional as F
+
+PlaneDict = Dict[str, Tensor]
+
+def group_norm(channels: int) -> nn.GroupNorm:
+    groups = min(8, channels)
+    while channels % groups != 0:
+        groups -= 1
+    return nn.GroupNorm(groups, channels)
+
+
+@dataclass(frozen=True)
+class TriplaneConfig:
+    image_size: int = 128
+    plane_resolution: int = 64
+    plane_channels: int = 32
+    patch_size: int = 8
+    token_dim: int = 256
+    latent_dim: int = 512
+
+    def __post_init__(self) -> None:
+        if self.plane_resolution % self.patch_size != 0:
+            raise ValueError("plane_resolution must be divisible by patch_size")
+        if self.plane_resolution < 8:
+            raise ValueError("plane_resolution must be at least 8")
+
+class ImageEncoder(nn.Module):
+    """Small CNN image encoder used as a replaceable stand-in for a ViT/ResNet."""
+
+    def __init__(self, latent_dim: int) -> None:
+        super().__init__()
+        widths = [3, 64, 128, 256, 512]
+        layers = []
+        for in_channels, out_channels in zip(widths, widths[1:]):
+            layers.extend(
+                [
+                    nn.Conv2d(in_channels, out_channels, kernel_size=4, stride=2, padding=1),
+                    group_norm(out_channels),
+                    nn.SiLU(inplace=True),
+                ]
+            )
+
+        self.features = nn.Sequential(*layers)
+        self.project = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(widths[-1], latent_dim),
+            nn.LayerNorm(latent_dim),
+        )
+
+    def forward(self, images: Tensor) -> Tensor:
+        return self.project(self.features(images))
+
+
+class TriplaneGenerator(nn.Module):
+    """Maps one image latent into three feature planes."""
+
+    def __init__(self, config: TriplaneConfig) -> None:
+        super().__init__()
+        self.config = config
+        self.seed_resolution = 8
+        self.seed_channels = 128
+        seed_values = 3 * self.seed_channels * self.seed_resolution**2
+        self.seed = nn.Sequential(
+            nn.Linear(config.latent_dim, config.latent_dim),
+            nn.SiLU(inplace=True),
+            nn.Linear(config.latent_dim, seed_values),
+        )
+
+        layers = []
+        channels = self.seed_channels
+        resolution = self.seed_resolution
+        while resolution < config.plane_resolution:
+            next_channels = max(config.plane_channels, channels // 2)
+            layers.extend(
+                [
+                    nn.ConvTranspose2d(channels, next_channels, kernel_size=4, stride=2, padding=1),
+                    group_norm(next_channels),
+                    nn.SiLU(inplace=True),
+                ]
+            )
+            channels = next_channels
+            resolution *= 2
+
+        layers.append(nn.Conv2d(channels, config.plane_channels, kernel_size=3, padding=1))
+        self.decoder = nn.Sequential(*layers)
+
+    def forward(self, image_latent: Tensor) -> PlaneDict:
+        cfg = self.config
+        batch = image_latent.shape[0]
+        seeds = self.seed(image_latent).view(
+            batch * 3,
+            self.seed_channels,
+            self.seed_resolution,
+            self.seed_resolution,
+        )
+        planes = self.decoder(seeds)
+        if planes.shape[-2:] != (cfg.plane_resolution, cfg.plane_resolution):
+            planes = F.interpolate(
+                planes,
+                size=(cfg.plane_resolution, cfg.plane_resolution),
+                mode="bilinear",
+                align_corners=False,
+            )
+        planes = planes.view(batch, 3, cfg.plane_channels, cfg.plane_resolution, cfg.plane_resolution)
+        return {"xy": planes[:, 0], "xz": planes[:, 1], "yz": planes[:, 2]}
+
+
+class PatchTokenizer(nn.Module):
+    """Patchifies each triplane and projects plane patches into token embeddings."""
+
+    def __init__(self, config: TriplaneConfig) -> None:
+        super().__init__()
+        patch_values = config.plane_channels * config.patch_size**2
+        self.config = config
+        self.proj = nn.Sequential(
+            nn.LayerNorm(patch_values),
+            nn.Linear(patch_values, config.token_dim),
+            nn.GELU(),
+            nn.Linear(config.token_dim, config.token_dim),
+        )
+        self.plane_embedding = nn.Parameter(torch.randn(3, config.token_dim) * 0.02)
+
+    def forward(self, planes: PlaneDict) -> Tensor:
+        ordered = [planes["xy"], planes["xz"], planes["yz"]]
+        token_groups = []
+
+        for plane_index, plane in enumerate(ordered):
+            patches = self._patchify(plane)
+            tokens = self.proj(patches)
+            tokens = tokens + self.plane_embedding[plane_index].view(1, 1, -1)
+            token_groups.append(tokens)
+
+        return torch.cat(token_groups, dim=1)
+
+    def _patchify(self, plane: Tensor) -> Tensor:
+        patch = self.config.patch_size
+        patches = F.unfold(plane, kernel_size=patch, stride=patch)
+        return patches.transpose(1, 2).contiguous()
+
+
+class TriplaneTokenizerModel(nn.Module):
+    """End-to-end image-to-token model."""
+
+    def __init__(self, config: TriplaneConfig) -> None:
+        super().__init__()
+        self.config = config
+        self.image_encoder = ImageEncoder(config.latent_dim)
+        self.triplane_generator = TriplaneGenerator(config)
+        self.tokenizer = PatchTokenizer(config)
+
+    def forward(self, images: Tensor) -> Tuple[PlaneDict, Tensor]:
+        latent = self.image_encoder(images)
+        planes = self.triplane_generator(latent)
+        tokens = self.tokenizer(planes)
+        return planes, tokens
+
+
+def sample_triplanes(planes: PlaneDict, xyz: Tensor) -> Tensor:
+    """
+    Bilinearly samples XY/XZ/YZ planes at normalized 3D points.
+
+    Args:
+        planes: dict of B x C x H x W triplanes.
+        xyz: B x N x 3 coordinates in [-1, 1].
+
+    Returns:
+        B x N x (3C) concatenated features, suitable for a radiance/occupancy MLP.
+    """
+    grids = {
+        "xy": xyz[..., [0, 1]],
+        "xz": xyz[..., [0, 2]],
+        "yz": xyz[..., [1, 2]],
+    }
+    samples = []
+    for name, grid in grids.items():
+        grid = grid.view(grid.shape[0], 1, grid.shape[1], 2)
+        sampled = F.grid_sample(planes[name], grid, align_corners=True)
+        samples.append(sampled.squeeze(2).transpose(1, 2))
+    return torch.cat(samples, dim=-1)
+
+
+def load_image(path: Optional[Path], image_size: int) -> Tensor:
+    if path is None:
+        return torch.randn(1, 3, image_size, image_size)
+
+    try:
+        from PIL import Image
+    except ImportError as exc:
+        raise SystemExit("Install Pillow to load images: python -m pip install pillow") from exc
+
+    image = Image.open(path).convert("RGB").resize((image_size, image_size))
+    data = torch.tensor(list(image.getdata()), dtype=torch.float32)
+    data = data.view(image_size, image_size, 3).permute(2, 0, 1) / 255.0
+    return data.unsqueeze(0) * 2.0 - 1.0
+
+
+def run_demo(args: argparse.Namespace) -> None:
+    config = TriplaneConfig(
+        image_size=args.image_size,
+        plane_resolution=args.plane_resolution,
+        plane_channels=args.plane_channels,
+        patch_size=args.patch_size,
+        token_dim=args.token_dim,
+    )
+    model = TriplaneTokenizerModel(config).eval()
+    image = load_image(args.image, config.image_size)
+
+    with torch.no_grad():
+        planes, tokens = model(image)
+        points = torch.rand(1, 1024, 3) * 2.0 - 1.0
+        sampled = sample_triplanes(planes, points)
+
+    plane_shape = tuple(planes["xy"].shape)
+    print(f"image:   {tuple(image.shape)}")
+    print(f"xy/xz/yz planes: {plane_shape} each")
+    print(f"tokens:  {tuple(tokens.shape)}")
+    print(f"samples: {tuple(sampled.shape)}")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Triplane tokenization prototype")
+    parser.add_argument("--image", type=Path, default=None, help="Optional RGB image path")
+    parser.add_argument("--image-size", type=int, default=128)
+    parser.add_argument("--plane-resolution", type=int, default=64)
+    parser.add_argument("--plane-channels", type=int, default=32)
+    parser.add_argument("--patch-size", type=int, default=8)
+    parser.add_argument("--token-dim", type=int, default=256)
+    return parser
+
+
+if __name__ == "__main__":
+    run_demo(build_parser().parse_args())
